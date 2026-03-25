@@ -9,7 +9,7 @@ import sys
 import math
 import bisect
 import pickle
-from numpy.lib.function_base import average
+from numpy import average
 from sklearn import metrics
 import soundfile as sf
 from sklearn.metrics import average_precision_score, roc_auc_score, accuracy_score

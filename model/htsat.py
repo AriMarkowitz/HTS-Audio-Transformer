@@ -7,6 +7,7 @@
 
 
 import logging
+import os
 import pdb
 import math
 import random
@@ -14,15 +15,16 @@ from numpy.core.fromnumeric import clip, reshape
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
+import numpy as np
 
 from torchlibrosa.stft import Spectrogram, LogmelFilterBank
 from torchlibrosa.augmentation import SpecAugmentation
+import torchaudio.transforms as T
 
 from itertools import repeat
 from typing import List
 from .layers import PatchEmbed, Mlp, DropPath, trunc_normal_, to_2tuple
 from utils import do_mixup, interpolate
-
 
 # below codes are based and referred from https://github.com/microsoft/Swin-Transformer
 # Swin Transformer for Computer Vision: https://arxiv.org/pdf/2103.14030.pdf
@@ -140,6 +142,30 @@ class WindowAttention(nn.Module):
     def extra_repr(self):
         return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
 
+def build_nmfk_mel_extractor(
+    sample_rate: int = 32000,
+    n_fft: int = 1024,
+    hop_length: int = 320,
+    n_mels: int = 64,
+    f_min: float = 50.0,
+    f_max: float = 14000.0,
+    power: float = 2.0,
+):
+    return T.MelSpectrogram(
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        win_length=n_fft,
+        hop_length=hop_length,
+        f_min=f_min,
+        f_max=f_max,
+        n_mels=n_mels,
+        window_fn=torch.hann_window,
+        power=power,
+        center=True,
+        pad_mode="reflect",
+        norm="slaney",
+        mel_scale="slaney",
+    )
 
 # We use the model based on Swintransformer Block, therefore we can use the swin-transformer pretrained model
 class SwinTransformerBlock(nn.Module):
@@ -409,7 +435,7 @@ class HTSAT_Swin_Transformer(nn.Module):
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, 
                  ape=False, patch_norm=True,
-                 use_checkpoint=False, norm_before_mlp='ln', config = None, **kwargs):
+                 use_checkpoint=False, norm_before_mlp='ln', config = None, W_path = None, **kwargs):
         super(HTSAT_Swin_Transformer, self).__init__()
 
         self.config = config
@@ -440,6 +466,15 @@ class HTSAT_Swin_Transformer(nn.Module):
 
         self.use_checkpoint = use_checkpoint
 
+        if W_path is None:
+            W_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))))),
+                "nmf_analysis", "output", "W_k56.npy")
+        _W = torch.from_numpy(np.load(W_path)).float()
+        self.register_buffer('W_inf', _W)
+        self.nmf_k = _W.shape[1]  # number of NMF components
+
         #  process mel-spec ; used only once
         self.freq_ratio = self.spec_size // self.config.mel_bins
         window = 'hann'
@@ -462,6 +497,14 @@ class HTSAT_Swin_Transformer(nn.Module):
             freq_drop_width=8, freq_stripes_num=2) # 2 2
         self.bn0 = nn.BatchNorm2d(self.config.mel_bins)
 
+        # NMF-viable spectogram extractor
+        self.nmfk_mel = build_nmfk_mel_extractor(
+            sample_rate=config.sample_rate,
+            n_fft=config.window_size,
+            hop_length=config.hop_size,
+            n_mels=config.mel_bins,
+            f_min=config.fmin,
+            f_max=config.fmax)
 
         # split spctrogram into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -554,6 +597,10 @@ class HTSAT_Swin_Transformer(nn.Module):
         else:
             self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
+        # NMF feature projection: maps summary features to class logits
+        nmf_feat_dim = 2 * self.nmf_k  # mean + max over time
+        self.nmf_proj = nn.Linear(nmf_feat_dim, num_classes)
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -573,14 +620,106 @@ class HTSAT_Swin_Transformer(nn.Module):
     def no_weight_decay_keywords(self):
         return {'relative_position_bias_table'}
 
+    @staticmethod
+    def _solve_nmf_h(
+        V: torch.Tensor,
+        W: torch.Tensor,
+        num_iters: int = 50,
+        eps: float = 1e-8
+    ) -> torch.Tensor:
+        """
+        Solve for H in V ~= W H with W fixed, using batched multiplicative updates.
 
-    def forward_features(self, x):
+        Parameters
+        ----------
+        V : torch.Tensor
+            Nonnegative spectrogram batch of shape [B, F, T].
+        W : torch.Tensor
+            Fixed global dictionary of shape [F, K].
+        num_iters : int
+            Number of multiplicative update steps.
+        eps : float
+            Small positive constant for numerical stability.
+        normalize_h : bool
+            If True, L1-normalize H across the component axis at each time step.
+
+        Returns
+        -------
+        H : torch.Tensor
+            Nonnegative activations of shape [B, K, T].
+        """
+        if V.ndim != 3:
+            raise ValueError(f"V must have shape [B, F, T], got {tuple(V.shape)}")
+        if W.ndim != 2:
+            raise ValueError(f"W must have shape [F, K], got {tuple(W.shape)}")
+
+        B, F, T = V.shape
+        F_w, K = W.shape
+
+        if F != F_w:
+            raise ValueError(f"V has F={F}, but W has F={F_w}")
+
+        if torch.any(V < 0):
+            raise ValueError("V must be nonnegative")
+        if torch.any(W < 0):
+            raise ValueError("W must be nonnegative")
+
+        device = V.device
+        dtype = V.dtype
+
+        W = W.to(device=device, dtype=dtype)
+
+        # Initialization: positive constant
+        H = torch.ones((B, K, T), device=device, dtype=dtype)
+
+        WT = torch.transpose(W, 0, 1)              # [K, F]
+        WTW = torch.matmul(WT, W)                  # [K, K]
+        WTV = torch.matmul(WT.unsqueeze(0), V)     # [B, K, T]
+
+        for _ in range(num_iters):
+            denom = torch.matmul(WTW.unsqueeze(0), H) + eps   # [B, K, T]
+            H = H * (WTV / denom)
+            H = torch.clamp(H, min=eps)
+
+        return H
+
+
+    @staticmethod
+    def _summarize_nmf_h(
+        H: torch.Tensor,
+        use_mean: bool = True,
+        use_max: bool = True,
+        use_std: bool = False,
+    ) -> torch.Tensor:
+        """
+        Turn H of shape [B, K, T] into a clip-level summary [B, D].
+        """
+        if H.ndim != 3:
+            raise ValueError(f"H must have shape [B, K, T], got {tuple(H.shape)}")
+
+        features = []
+
+        if use_mean:
+            features.append(torch.mean(H, dim=2))          # [B, K]
+
+        if use_max:
+            features.append(torch.amax(H, dim=2))          # [B, K]
+
+        if use_std:
+            features.append(torch.std(H, dim=2))           # [B, K]
+
+        if not features:
+            raise ValueError("At least one summary statistic must be enabled")
+
+        return torch.cat(features, dim=1)                  # [B, D]
+    
+    def forward_features(self, x, y):
         # A deprecated optimization for using a hierarchical output from different blocks
         # if self.config.htsat_hier_output:
         #     hier_x = []
         #     hier_attn = []
 
-        frames_num = x.shape[2]        
+        frames_num = x.shape[2]
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -642,6 +781,12 @@ class HTSAT_Swin_Transformer(nn.Module):
             # get latent_output
             latent_output = self.avgpool(torch.flatten(x,2))
             latent_output = torch.flatten(latent_output, 1)
+            
+            y_squeezed = y.squeeze(1)
+            with torch.no_grad():
+                additional_features = self._summarize_nmf_h(self._solve_nmf_h(y_squeezed, self.W_inf))  # shape: (B, 2*K)
+
+            augmented_embedding = torch.cat([latent_output, additional_features], dim=1)
 
             # display the attention map, if needed
             if self.config.htsat_attn_heatmap:
@@ -681,17 +826,21 @@ class HTSAT_Swin_Transformer(nn.Module):
             x = self.avgpool(x)
             x = torch.flatten(x, 1)
 
+            # Add NMF feature contribution to classification logits
+            nmf_logits = self.nmf_proj(additional_features)
+            x = x + nmf_logits
+
             if self.config.loss_type == "clip_ce":
                 output_dict = {
                     'framewise_output': fpx, # already sigmoided
                     'clipwise_output': x,
-                    'latent_output': latent_output
+                    'latent_output': augmented_embedding
                 }
             else:
                 output_dict = {
                     'framewise_output': fpx, # already sigmoided
                     'clipwise_output': torch.sigmoid(x),
-                    'latent_output': latent_output
+                    'latent_output': augmented_embedding
                 }
            
         else:
@@ -705,13 +854,32 @@ class HTSAT_Swin_Transformer(nn.Module):
             fpx = fpx.permute(0,1,3,2,4).contiguous().reshape(B, C, c_freq_bin, -1)
             fpx = torch.sum(fpx, dim = 2)
             fpx = interpolate(fpx.permute(0,2,1).contiguous(), 8 * self.patch_stride[1]) 
-            x = self.avgpool(x.transpose(1, 2))  # B C 1
-            x = torch.flatten(x, 1)
+
+            # Latent embedding
+            latent_output = self.avgpool(x.transpose(1, 2))  # B C 1
+            latent_output = torch.flatten(latent_output, 1)
+
+            # NMF features
+            y_squeezed = y.squeeze(1)
+            with torch.no_grad():
+                additional_features = self._summarize_nmf_h(
+                    self._solve_nmf_h(y_squeezed, self.W_inf))  # (B, 2*K)
+            augmented_embedding = torch.cat([latent_output, additional_features], dim=1)
+
+            x = latent_output
             if self.num_classes > 0:
                 x = self.head(x)
                 fpx = self.head(fpx)
-            output_dict = {'framewise_output': torch.sigmoid(fpx), 
-                'clipwise_output': torch.sigmoid(x)}
+
+            # Add NMF feature contribution to classification logits
+            nmf_logits = self.nmf_proj(additional_features)
+            x = x + nmf_logits
+
+            output_dict = {
+                'framewise_output': torch.sigmoid(fpx), 
+                'clipwise_output': torch.sigmoid(x),
+                'latent_output': augmented_embedding
+            }
         return output_dict
 
     def crop_wav(self, x, crop_size, spe_pos = None):
@@ -760,10 +928,19 @@ class HTSAT_Swin_Transformer(nn.Module):
         return x
 
     def forward(self, x: torch.Tensor, mixup_lambda = None, infer_mode = False):# out_feat_keys: List[str] = None):
+        with torch.no_grad():
+            if x.dim() == 3 and x.shape[1] == 1:
+                y = x[:, 0, :]
+            else:
+                y = x.clone()
+
+            y = self.nmfk_mel(y)         # (B, mel_bins, frames)
+            y = torch.clamp(y, min=1e-10)       # match your original floor
+            y = y.unsqueeze(1)                  # (B, 1, mel_bins, frames)    
+
         x = self.spectrogram_extractor(x)   # (batch_size, 1, time_steps, freq_bins)
         x = self.logmel_extractor(x)    # (batch_size, 1, time_steps, mel_bins)
-        
-        
+              
         x = x.transpose(1, 3)
         x = self.bn0(x)
         x = x.transpose(1, 3)
@@ -772,6 +949,8 @@ class HTSAT_Swin_Transformer(nn.Module):
         if self.training and mixup_lambda is not None:
             x = do_mixup(x, mixup_lambda)
         
+
+        
         if infer_mode:
             # in infer mode. we need to handle different length audio input
             frame_num = x.shape[2]
@@ -779,18 +958,18 @@ class HTSAT_Swin_Transformer(nn.Module):
             repeat_ratio = math.floor(target_T / frame_num)
             x = x.repeat(repeats=(1,1,repeat_ratio,1))
             x = self.reshape_wav2img(x)
-            output_dict = self.forward_features(x)
+            output_dict = self.forward_features(x, y)
         elif self.config.enable_repeat_mode:
             if self.training:
                 cur_pos = random.randint(0, (self.freq_ratio - 1) * self.spec_size - 1)
                 x = self.repeat_wat2img(x, cur_pos)
-                output_dict = self.forward_features(x)
+                output_dict = self.forward_features(x, y)
             else:
                 output_dicts = []
                 for cur_pos in range(0, (self.freq_ratio - 1) * self.spec_size + 1, self.spec_size):
                     tx = x.clone()
                     tx = self.repeat_wat2img(tx, cur_pos)
-                    output_dicts.append(self.forward_features(tx))
+                    output_dicts.append(self.forward_features(tx, y))
                 clipwise_output = torch.zeros_like(output_dicts[0]["clipwise_output"]).float().to(x.device)
                 framewise_output = torch.zeros_like(output_dicts[0]["framewise_output"]).float().to(x.device)
                 for d in output_dicts:
@@ -801,14 +980,15 @@ class HTSAT_Swin_Transformer(nn.Module):
 
                 output_dict = {
                     'framewise_output': framewise_output, 
-                    'clipwise_output': clipwise_output
+                    'clipwise_output': clipwise_output,
+                    'latent_output': output_dicts[0].get('latent_output')
                 }
         else:
             if x.shape[2] > self.freq_ratio * self.spec_size:
                 if self.training:
                     x = self.crop_wav(x, crop_size=self.freq_ratio * self.spec_size)
                     x = self.reshape_wav2img(x)
-                    output_dict = self.forward_features(x)
+                    output_dict = self.forward_features(x, y)
                 else:
                     # Change: Hard code here
                     overlap_size = (x.shape[2] - 1) // 4
@@ -817,7 +997,7 @@ class HTSAT_Swin_Transformer(nn.Module):
                     for cur_pos in range(0, x.shape[2] - crop_size - 1, overlap_size):
                         tx = self.crop_wav(x, crop_size = crop_size, spe_pos = cur_pos)
                         tx = self.reshape_wav2img(tx)
-                        output_dicts.append(self.forward_features(tx))
+                        output_dicts.append(self.forward_features(tx, y))
                     clipwise_output = torch.zeros_like(output_dicts[0]["clipwise_output"]).float().to(x.device)
                     framewise_output = torch.zeros_like(output_dicts[0]["framewise_output"]).float().to(x.device)
                     for d in output_dicts:
@@ -827,10 +1007,11 @@ class HTSAT_Swin_Transformer(nn.Module):
                     framewise_output = framewise_output / len(output_dicts)
                     output_dict = {
                         'framewise_output': framewise_output, 
-                        'clipwise_output': clipwise_output
+                        'clipwise_output': clipwise_output,
+                        'latent_output': output_dicts[0].get('latent_output')
                     }
             else: # this part is typically used, and most easy one
                 x = self.reshape_wav2img(x)
-                output_dict = self.forward_features(x)
+                output_dict = self.forward_features(x, y)
         # x = self.head(x)
         return output_dict
